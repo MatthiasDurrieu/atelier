@@ -12,19 +12,56 @@
 #   runscript bash long_job.sh arg1 arg2
 # =============================================================================
 runscript() {
-    if [[ $# -eq 0 ]]; then
-        echo "Usage: runscript <command> [args...]" >&2
-        echo "       runscript --test          # smoke-test the whole pipeline" >&2
-        return 1
-    fi
+    # ---------- Parse runscript-level flags ---------------------------------
+    # These must come BEFORE the command. Flags after the command are
+    # treated as part of your command's own arguments.
+    local attach=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --attach|-a)
+                attach=1
+                shift
+                ;;
+            --test|-t)
+                # Self-test: run a trivial command through the whole pipeline.
+                shift
+                local test_args=()
+                [[ $attach -eq 1 ]] && test_args=(--attach)
+                test_args+=(bash -c 'echo "runscript self-test"; echo "host: $(hostname)"; echo "date: $(date)"; sleep 2; echo "all good"')
+                echo "Running runscript self-test..."
+                runscript "${test_args[@]}"
+                return $?
+                ;;
+            --help|-h)
+                cat <<'HELP'
+Usage: runscript [--attach|-a] <command> [args...]
+       runscript [--attach|-a] --test
+       runscript --help
 
-    # ---------- Self-test mode -----------------------------------------------
-    # Runs a trivial command through the full runscript pipeline so you can
-    # verify your phone gets the notification.
-    if [[ "$1" == "--test" || "$1" == "-t" ]]; then
-        echo "Running runscript self-test..."
-        runscript bash -c 'echo "runscript self-test"; echo "host: $(hostname)"; echo "date: $(date)"; sleep 2; echo "all good"'
-        return $?
+Options (must come BEFORE the command):
+  --attach, -a    Attach to the screen session immediately (Ctrl-a d to detach)
+  --test,   -t    Run a 2-second self-test through the full pipeline
+  --help,   -h    Show this help
+
+Examples:
+  runscript python train.py --epochs 50
+  runscript --attach python -u train.py --epochs 50
+  runscript bash long_job.sh /data/raw /data/processed
+  runscript --test
+HELP
+                return 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: runscript [--attach] <command> [args...]" >&2
+        echo "       runscript --test          # smoke-test the whole pipeline" >&2
+        echo "       runscript --help" >&2
+        return 1
     fi
 
     # ---------- Identify a script name (used for log + session name) ----------
@@ -138,7 +175,10 @@ PUSHOVER_USER_KEY=$(printf '%q' "$PUSHOVER_USER_KEY")
 START_TS=\$(date +%s)
 START_HUMAN=\$(date '+%Y-%m-%d %H:%M:%S')
 
-# --- Run the user's command, capturing all output to the log -----------------
+# --- Run the user's command, streaming output to BOTH the screen and log ---
+# tee duplicates output so reattaching with \`screen -r\` shows live progress.
+# PIPESTATUS[0] preserves the user-command's real exit code across the pipe.
+set -o pipefail
 {
     echo "================================================"
     echo "runscript wrapper"
@@ -149,8 +189,9 @@ START_HUMAN=\$(date '+%Y-%m-%d %H:%M:%S')
     echo "================================================"
     echo
     $quoted_cmd
-} > "\$LOG_FILE" 2>&1
-EXIT_CODE=\$?
+} 2>&1 | tee "\$LOG_FILE"
+EXIT_CODE=\${PIPESTATUS[0]}
+set +o pipefail
 
 END_TS=\$(date +%s)
 DUR=\$(( END_TS - START_TS ))
@@ -183,7 +224,7 @@ Session: \$SESSION_NAME
 Log: \$LOG_FILE"
 fi
 
-# --- Append summary footer to the log ----------------------------------------
+# --- Print + append summary footer to both screen and log -------------------
 {
     echo
     echo "================================================"
@@ -191,7 +232,7 @@ fi
     echo "Duration : \$DUR_STR"
     echo "Exit code: \$EXIT_CODE"
     echo "================================================"
-} >> "\$LOG_FILE"
+} 2>&1 | tee -a "\$LOG_FILE"
 
 # --- Send notification with retries ------------------------------------------
 NOTIF_OK=0
@@ -219,20 +260,57 @@ WRAPPER_EOF
     chmod +x "$wrapper_script"
 
     # =========================================================================
-    # (1) LAUNCH IN A DETACHED `screen` SESSION
+    # (1) LAUNCH IN A `screen` SESSION (detached or attached)
     # =========================================================================
-    if ! screen -dmS "$session_name" bash "$wrapper_script"; then
-        echo "ERROR: failed to start screen session" >&2
-        rm -f "$wrapper_script"
-        return 1
-    fi
+    if [[ $attach -eq 1 ]]; then
+        # Foreground/attached: control returns when the session ends or the
+        # user detaches with Ctrl-a d.
+        cat <<INFO
 
-    sleep 0.2
-    if ! screen -list 2>/dev/null | grep -qE "[0-9]+\.${session_name}\b"; then
-        echo "WARN: screen session may not have started; check 'screen -ls'" >&2
-    fi
+Launching attached in screen session: $session_name
+   Detach (keep running):  Ctrl-a d
+   Kill the command:       Ctrl-c (will trigger a FAIL notification)
+   Log file:               $log_file
 
-    cat <<INFO
+INFO
+        screen -S "$session_name" bash "$wrapper_script"
+        local screen_rc=$?
+
+        # When `screen` returns, the session has either ended (command
+        # finished or was killed) or the user detached.
+        if screen -list 2>/dev/null | grep -qE "[0-9]+\.${session_name}\b"; then
+            cat <<INFO
+
+Detached. Session is still running in the background.
+   Reattach:    screen -r $session_name
+   List all:    screen -ls
+   Kill:        screen -X -S $session_name quit
+   Log file:    $log_file
+
+INFO
+        else
+            cat <<INFO
+
+Session ended. Notification sent (check your phone).
+   Log file:    $log_file
+
+INFO
+        fi
+        return $screen_rc
+    else
+        # Detached: launch and return immediately.
+        if ! screen -dmS "$session_name" bash "$wrapper_script"; then
+            echo "ERROR: failed to start screen session" >&2
+            rm -f "$wrapper_script"
+            return 1
+        fi
+
+        sleep 0.2
+        if ! screen -list 2>/dev/null | grep -qE "[0-9]+\.${session_name}\b"; then
+            echo "WARN: screen session may not have started; check 'screen -ls'" >&2
+        fi
+
+        cat <<INFO
 
 Launched in screen session: $session_name
    Log file:    $log_file
@@ -242,4 +320,5 @@ Launched in screen session: $session_name
    Kill:        screen -X -S $session_name quit
 
 INFO
+    fi
 }

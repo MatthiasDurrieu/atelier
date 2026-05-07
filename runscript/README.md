@@ -37,8 +37,9 @@ distracted. `runscript` fixes both ends of that:
   - `.sh` / `.bash` files pass `bash -n`
   - `.py` files pass `python -m py_compile`
   - required env vars (`PUSHOVER_*`, `LOGS_DIRECTORY`) are set
-- Runs the command in a detached `screen` session named after the script and
-  timestamp — easy to find with `screen -ls`.
+- Runs the command in a `screen` session named after the script and
+  timestamp — easy to find with `screen -ls`. Detached by default; pass
+  `--attach` to watch it run live (Ctrl-a d to drop out, job keeps running).
 - Captures full stdout/stderr to a timestamped log file with a header
   (command, start time) and footer (duration, exit code).
 - Sends a Pushover notification on completion with:
@@ -90,14 +91,24 @@ distracted. `runscript` fixes both ends of that:
 ## Usage
 
 ```bash
-runscript <command> [args...]
+runscript [--attach|-a] <command> [args...]
+runscript --test          # smoke-test the whole pipeline
+runscript --help
 ```
+
+Runscript options (`--attach`, `--test`, `--help`) must come **before** the
+command. Anything after the command is passed through to the command verbatim,
+so a script that legitimately accepts an `--attach` argument of its own won't
+collide.
 
 ### Examples
 
 ```bash
-# Python training run
+# Detached (default): launch and return to your shell
 runscript python train.py --epochs 50 --lr 0.001
+
+# Attached: watch the script run live, then Ctrl-a d to detach when satisfied
+runscript --attach python -u train.py --epochs 50
 
 # Long bash script with arguments
 runscript bash process_data.sh /data/raw /data/processed
@@ -105,9 +116,25 @@ runscript bash process_data.sh /data/raw /data/processed
 # One-liner
 runscript bash -c 'for f in *.csv; do gzip "$f"; done'
 
-# Self-test
+# Self-test (works with --attach too)
 runscript --test
+runscript --attach --test
 ```
+
+### `--attach` workflow
+
+Use `--attach` when you want to babysit the first few seconds of a job to make
+sure it's actually running correctly, then drop out and let the notification
+tell you when it's done:
+
+1. `runscript --attach python -u train.py --epochs 50`
+2. Watch stdout: data loads, first epoch starts, loss looks sensible…
+3. Press **Ctrl-a d** to detach. The job keeps running in the background.
+4. Get on with your day. Phone buzzes when it finishes.
+
+While attached you can also kill the job with **Ctrl-c** — that sends SIGINT
+to your command, which will exit non-zero and trigger a FAIL notification
+with the exit code and the last lines of the log.
 
 ### What gets printed
 
@@ -131,6 +158,28 @@ screen -r train_20260507130412               # reattach (Ctrl-a d to detach)
 screen -X -S train_20260507130412 quit       # kill the session
 tail -f $LOGS_DIRECTORY/train.py_*.log       # follow log without attaching
 ```
+
+## Live output (and a buffering gotcha)
+
+Output is piped through `tee` so it goes to the log file *and* the screen
+terminal at the same time. Reattach with `screen -r <session>` any time to see
+live progress, then press `Ctrl-a d` to detach.
+
+Because the command's stdout is a pipe (not a tty), libc switches most
+programs from line-buffered to fully buffered, so `print()` calls may not
+appear live until a chunk fills up. To force line buffering:
+
+```bash
+# Python: use the -u flag, or set the env var
+runscript python -u train.py --epochs 50
+runscript env PYTHONUNBUFFERED=1 python train.py --epochs 50
+
+# Anything else: wrap with stdbuf
+runscript stdbuf -oL -eL ./my_program --some-arg
+```
+
+If you mostly run Python, exporting `PYTHONUNBUFFERED=1` once in your shell rc
+file makes this automatic.
 
 ## What the notification looks like
 
